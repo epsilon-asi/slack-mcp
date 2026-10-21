@@ -6,7 +6,7 @@ Disclaimer: This is not an official Red Hat tool.
 
 ## What is this and why should I use it?
 
-This MCP server transforms your Slack workspace into an AI-accessible environment. It provides 21+ tools for comprehensive Slack interaction:
+This MCP server transforms your Slack workspaces into an AI-accessible environment. It provides 27 tools for comprehensive Slack interaction, across one workspace or several at once:
 
 **Message & Thread Operations**
 
@@ -27,13 +27,20 @@ This MCP server transforms your Slack workspace into an AI-accessible environmen
 - Send direct messages and group DMs
 - Manage usergroups (clear members)
 
+**Status & Presence**
+
+- Set, clear, and read your status across every workspace at once
+- Set presence (auto/away) across every workspace at once
+
 **Utility**
 
 - Check authentication status
-- Cache management for performance
+- List configured workspaces and verify their tokens
+- Per-workspace cache management for performance
 
 ### Key Benefits
 
+- **Multiple Workspaces**: Hold several Slack accounts at once and act in one, some, or all of them
 - **Seamless Integration**: Connect your AI assistant directly to Slack without manual copy-pasting
 - **Automated Workflows**: Build AI-powered Slack bots that can read, analyze, and respond to messages
 - **Enhanced Productivity**: Let AI help manage notifications, summarize conversations, or automate routine Slack tasks
@@ -147,6 +154,93 @@ Set `SLACK_BOT_TOKEN` instead of `SLACK_XOXC_TOKEN`/`SLACK_XOXD_TOKEN`:
 `LOGS_CHANNEL_ID` is optional. When omitted, tool activity is written to **stderr** instead of posted to Slack.
 
 If both `SLACK_BOT_TOKEN` and `SLACK_XOXC_TOKEN`/`SLACK_XOXD_TOKEN` are set, the bot token takes precedence.
+
+## Multiple workspaces
+
+The server can hold several Slack workspaces at once and act in any of them.
+Point `workspaces.json` at `~/.local/share/slack-mcp/` (override with
+`SLACK_MCP_WORKSPACES_FILE`):
+
+```json
+{
+  "default": "work",
+  "xoxd": "xoxd-...",
+  "accounts": {
+    "work":      { "team_id": "T0000001", "team_name": "Work",      "xoxc": "xoxc-...", "logs_channel": "C7000000" },
+    "community": { "team_id": "T0000002", "team_name": "Community", "xoxc": "xoxc-..." },
+    "ci":        { "team_id": "T0000003", "bot_token": "xoxb-..." }
+  }
+}
+```
+
+One Slack login shares a single `d` cookie across every workspace it is signed
+into, so `xoxd` is declared once at the top level; a per-account `xoxd` (or
+`bot_token`) overrides it. Each account gets its own `xoxc`.
+
+- `default` names the account used when a tool is given no `workspace`. If it
+  is missing or unknown, the first account wins.
+- Each account caches channels and users separately, under
+  `~/.local/share/slack-mcp/accounts/<team_id>/`. Channel names and user IDs are
+  workspace-scoped, so a shared cache would resolve `#general` to whichever
+  workspace was cached first.
+- **When `workspaces.json` exists, it is the only source of accounts** —
+  `SLACK_BOT_TOKEN` and `SLACK_XOXC_TOKEN`/`SLACK_XOXD_TOKEN` in the environment
+  are ignored, and the server logs a line saying so. Without the file, those
+  variables define a single account called `default`, exactly as before.
+
+Run `list_workspaces` to see the configured aliases, or
+`list_workspaces(verify=true)` to also check each token against `auth.test`.
+
+### Selecting workspaces
+
+Tools that understand workspaces take a `workspace` argument:
+
+| Value | Meaning |
+| --- | --- |
+| omitted / `""` | the `default` account |
+| `"all"` or `"*"` | every configured account |
+| `"work"` | one account, by alias, team ID, or team name (case-insensitive) |
+| `"work,community"` | several, in the order given |
+
+An unknown name is rejected before any API call rather than silently skipped.
+Fan-out runs the workspaces concurrently and returns a per-workspace map, so one
+expired token does not stop the rest:
+
+```json
+{
+  "work":      { "ok": true, "status_text": "Heads down", "status_emoji": ":no_bell:", "status_expiration": 0 },
+  "community": { "ok": false, "error": "token_expired" }
+}
+```
+
+## Status across every workspace
+
+`set_status` defaults to `workspace: "all"` — one call updates your status
+everywhere:
+
+```
+set_status(text="In a meeting", emoji=":calendar:", expiration="1h")
+```
+
+- `emoji` takes either form, `:calendar:` or `calendar`.
+- `expiration` accepts a relative offset (`30m`, `2h`, `1d`), an ISO 8601
+  date/time, or a Unix timestamp. Omit it and the status stays until cleared.
+- `clear_status` wipes text and emoji; `get_status` reads back what each
+  workspace currently shows.
+- `set_presence("away" | "auto")` fans out the same way.
+
+Two things worth knowing:
+
+**Status requires user tokens.** A bot token can only change the bot's own
+profile, never yours, so `set_status`, `clear_status`, and `set_presence` refuse
+any `xoxb-` account with a clear error instead of a confusing one from Slack.
+Workspaces configured with a bot token are listed by `list_workspaces` with
+`can_set_status: false`.
+
+**Custom emoji do not cross workspaces.** `:team-standup:` set everywhere will
+render blank wherever it is not defined. When an emoji exists as a custom emoji
+in one of your workspaces but not another, the result for that workspace carries
+a `warning`. Standard Slack emoji never warn.
 
 ## Read-only mode
 
