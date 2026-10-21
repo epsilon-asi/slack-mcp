@@ -4,8 +4,12 @@
 # Extracts xoxc/xoxd tokens directly from the Slack desktop app's local
 # storage on disk. No browser window, no DevTools, no manual copy-paste.
 #
+# Every workspace the app is signed in to is extracted, not just the first:
+# Slack keeps one xoxc token per workspace in localConfig_v2.teams, and a
+# single `d` cookie shared across all of them.
+#
 # Requires: Slack desktop app installed and signed in, python3,
-#           python3-cryptography, secret-tool (libsecret), curl, jq
+#           python3-cryptography, secret-tool (libsecret), curl
 #
 # Usage:
 #   slack-refresh-tokens              # Auto-extract from desktop app
@@ -14,18 +18,23 @@
 #   slack-refresh-tokens --help
 #
 # Token storage (compatible with setup-slack-mcp.py):
-#   ~/.local/share/slack-mcp/tokens.env
+#   ~/.local/share/slack-mcp/workspaces.json   all workspaces
+#   ~/.local/share/slack-mcp/tokens.env        default workspace only
 #
 # Works on Linux with GNOME Keyring. The Slack desktop app (Electron)
 # encrypts cookies using a key stored in the system keyring. This script
 # retrieves that key, decrypts the xoxd cookie, and extracts the xoxc
-# token from leveldb.
+# tokens from leveldb.
 set -euo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
-OUTPUT_FILE="${HOME}/.local/share/slack-mcp/tokens.env"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DATA_DIR="${SLACK_MCP_DATA:-${HOME}/.local/share/slack-mcp}"
+OUTPUT_FILE="${DATA_DIR}/tokens.env"
+WORKSPACES_FILE="${DATA_DIR}/workspaces.json"
 VALIDATE=false
 ENV_MODE=false
+DEFAULT_ALIAS=""
 
 # Auto-detect Slack installation: Flatpak or native
 if [[ -d "${HOME}/.var/app/com.slack.Slack/config/Slack" ]]; then
@@ -40,20 +49,25 @@ usage() {
   cat <<EOF
 Usage: $SCRIPT_NAME [OPTIONS]
 
-Extract Slack session tokens from the desktop app's local storage.
-Supports both native and Flatpak installations (auto-detected).
+Extract Slack session tokens for every signed-in workspace from the desktop
+app's local storage. Supports native and Flatpak installations (auto-detected).
 
 Options:
-  --validate    Validate tokens against Slack's auth.test API after extraction
-  --env         Print tokens as shell environment variables to stdout (no file write)
-  --output FILE Write tokens to FILE instead of the default ($OUTPUT_FILE)
-  --slack-dir D Override auto-detected Slack data directory
-  --help        Show this help
+  --validate        Validate every workspace against Slack's auth.test API
+  --env             Print the default workspace's tokens as shell environment
+                    variables to stdout (no file write)
+  --output FILE     Write tokens.env to FILE instead of the default
+                    ($OUTPUT_FILE)
+  --workspaces FILE Write workspaces.json to FILE instead of the default
+                    ($WORKSPACES_FILE)
+  --default ALIAS   Make ALIAS the default workspace in workspaces.json
+  --slack-dir D     Override auto-detected Slack data directory
+  --help            Show this help
 
 Requirements:
   - Slack desktop app installed and signed in
   - python3 with cryptography and secretstorage packages
-  - curl and jq (for --validate)
+  - curl (for --validate)
 
 EOF
   exit 0
@@ -61,12 +75,14 @@ EOF
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --validate)  VALIDATE=true; shift ;;
-    --env)       ENV_MODE=true; shift ;;
-    --output)    OUTPUT_FILE="$2"; shift 2 ;;
-    --slack-dir) SLACK_DIR="$2"; shift 2 ;;
-    --help|-h)   usage ;;
-    *)           echo "Unknown option: $1" >&2; exit 2 ;;
+    --validate)   VALIDATE=true; shift ;;
+    --env)        ENV_MODE=true; shift ;;
+    --output)     OUTPUT_FILE="$2"; shift 2 ;;
+    --workspaces) WORKSPACES_FILE="$2"; shift 2 ;;
+    --default)    DEFAULT_ALIAS="$2"; shift 2 ;;
+    --slack-dir)  SLACK_DIR="$2"; shift 2 ;;
+    --help|-h)    usage ;;
+    *)            echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
 
@@ -102,13 +118,22 @@ if ! python3 -c "import secretstorage" 2>/dev/null; then
   exit 1
 fi
 
-# --- Extract tokens ---
-export SLACK_DIR
-tokens=$(python3 -c "
-import sqlite3, os, hashlib, sys
+# --- Extract every workspace; emits a JSON payload on stdout ---
+export SLACK_DIR SCRIPT_DIR
+payload=$(python3 - <<'PY'
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+from slack_workspaces import accounts_from_teams, extract_local_config, find_teams_by_proximity
+
 import secretstorage
 
-slack_dir = os.environ['SLACK_DIR']
+slack_dir = Path(os.environ["SLACK_DIR"])
 
 # --- Get encryption key from system keyring ---
 # Supports both native ('application'='Slack') and Flatpak
@@ -137,12 +162,12 @@ if not keyring_pass:
     print('Is the Slack desktop app signed in?', file=sys.stderr)
     sys.exit(1)
 
-# --- xoxd: decrypt from Cookies SQLite ---
+# --- xoxd: decrypt from Cookies SQLite (one cookie for every workspace) ---
 key = hashlib.pbkdf2_hmac('sha1', keyring_pass.encode(), b'saltysalt', 1, dklen=16)
 
-conn = sqlite3.connect(os.path.join(slack_dir, 'Cookies'))
+conn = sqlite3.connect(str(slack_dir / 'Cookies'))
 row = conn.execute(
-    \"SELECT encrypted_value FROM cookies WHERE name = 'd' AND host_key = '.slack.com'\"
+    "SELECT encrypted_value FROM cookies WHERE name = 'd' AND host_key = '.slack.com'"
 ).fetchone()
 conn.close()
 
@@ -165,82 +190,148 @@ if idx < 0:
     sys.exit(1)
 xoxd = text[idx:]
 
-# --- xoxc: scan leveldb (newest files first for freshest token) ---
-ldb_dir = os.path.join(slack_dir, 'Local Storage', 'leveldb')
-xoxc = None
-def _mtime(f):
+# --- xoxc: every team in localConfig_v2, newest leveldb files first ---
+ldb_dir = slack_dir / 'Local Storage' / 'leveldb'
+
+
+def _mtime(path):
     try:
-        return os.path.getmtime(os.path.join(ldb_dir, f))
+        return path.stat().st_mtime
     except OSError:
         return -1
 
-files = sorted(
-    [f for f in os.listdir(ldb_dir) if f.endswith('.log') or f.endswith('.ldb')],
-    key=_mtime,
-    reverse=True
-)
-for f in files:
-    try:
-        data = open(os.path.join(ldb_dir, f), 'rb').read()
-        i = data.find(b'xoxc-')
-        if i >= 0:
-            end = i
-            while end < len(data) and data[end:end+1] not in (b'\"', b' ', b'\n', b'\x00', b'\t'):
-                end += 1
-            xoxc = data[i:end].decode('utf-8', errors='replace')
-            break
-    except Exception:
-        pass
 
-if not xoxc:
-    print('ERROR: xoxc token not found in Slack Local Storage.', file=sys.stderr)
+files = sorted(
+    (p for p in ldb_dir.glob('*') if p.suffix in ('.log', '.ldb')),
+    key=_mtime,
+    reverse=True,
+)
+
+teams = {}
+for path in files:
+    try:
+        blob = path.read_bytes()
+    except OSError:
+        continue
+    config = extract_local_config(blob)
+    found = (config or {}).get('teams') or {}
+    if not found:
+        # localConfig_v2 can be split across leveldb blocks; recover what we can.
+        found = find_teams_by_proximity(blob)
+    for team_id, team in found.items():
+        teams.setdefault(team_id, team)  # newest file wins
+
+accounts = accounts_from_teams(teams)
+if not accounts:
+    print('ERROR: no xoxc tokens found in Slack Local Storage.', file=sys.stderr)
+    print('Is the Slack desktop app signed in to at least one workspace?', file=sys.stderr)
     sys.exit(1)
 
-print(f'SLACK_MCP_XOXC_TOKEN={xoxc}')
-print(f'SLACK_MCP_XOXD_TOKEN={xoxd}')
-" 2>/dev/null)
+print(json.dumps({'xoxd': xoxd, 'accounts': accounts}))
+PY
+)
 
-if [[ -z "$tokens" ]]; then
+if [[ -z "$payload" ]]; then
   echo "ERROR: Token extraction failed." >&2
   exit 1
 fi
 
-xoxc=$(echo "$tokens" | grep '^SLACK_MCP_XOXC_TOKEN=' | cut -d= -f2-)
-xoxd=$(echo "$tokens" | grep '^SLACK_MCP_XOXD_TOKEN=' | cut -d= -f2-)
+export PAYLOAD="$payload"
 
 # --- Output ---
 if [[ "$ENV_MODE" == true ]]; then
-  echo "$tokens"
+  python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["PAYLOAD"])
+accounts = payload["accounts"]
+print(f"# {len(accounts)} workspace(s): " + ", ".join(
+    a["domain"] or a["team_name"] or a["team_id"] for a in accounts
+))
+print(f"SLACK_MCP_XOXC_TOKEN={accounts[0]['xoxc']}")
+print(f"SLACK_MCP_XOXD_TOKEN={payload['xoxd']}")
+PY
   exit 0
 fi
 
-mkdir -p "$(dirname "$OUTPUT_FILE")"
-cat > "$OUTPUT_FILE" <<EOF
-# Slack session tokens (auto-generated by $SCRIPT_NAME)
-# Generated: $(date -Iseconds)
+export OUTPUT_FILE WORKSPACES_FILE DEFAULT_ALIAS SCRIPT_NAME
+python3 - <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
 
-SLACK_MCP_XOXC_TOKEN=${xoxc}
-SLACK_MCP_XOXD_TOKEN=${xoxd}
-EOF
-chmod 600 "$OUTPUT_FILE"
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+from slack_workspaces import merge_workspaces, read_workspaces, write_tokens_env, write_workspaces
 
-echo "Tokens saved to $OUTPUT_FILE"
-echo "  xoxc: ${xoxc:0:15}...${xoxc: -8}"
-echo "  xoxd: ${xoxd:0:15}...${xoxd: -8}"
+payload = json.loads(os.environ["PAYLOAD"])
+accounts = payload["accounts"]
+xoxd = payload["xoxd"]
+
+workspaces_file = Path(os.environ["WORKSPACES_FILE"])
+tokens_file = Path(os.environ["OUTPUT_FILE"])
+requested_default = os.environ.get("DEFAULT_ALIAS") or None
+
+config = merge_workspaces(read_workspaces(workspaces_file), accounts, xoxd, requested_default)
+write_workspaces(workspaces_file, config)
+
+default_alias = config.get("default", "")
+default_entry = config.get("accounts", {}).get(default_alias, {})
+write_tokens_env(
+    tokens_file,
+    default_entry.get("xoxc", accounts[0]["xoxc"]),
+    xoxd,
+    default_entry.get("team_id", ""),
+    os.environ.get("SCRIPT_NAME", ""),
+)
+
+print(f"Workspaces saved to {workspaces_file}")
+for alias, entry in config.get("accounts", {}).items():
+    token = entry.get("xoxc") or entry.get("bot_token") or ""
+    marker = "  [default]" if alias == default_alias else ""
+    shown = f"{token[:15]}...{token[-8:]}" if len(token) > 23 else (token or "(no token)")
+    print(f"  {alias:<20} {entry.get('team_id', ''):<12} {shown}{marker}")
+print(f"Default workspace tokens also written to {tokens_file}")
+print(f"  xoxd: {xoxd[:15]}...{xoxd[-8:]}")
+PY
 
 # --- Validate ---
 if [[ "$VALIDATE" == true ]]; then
-  if ! command -v curl &>/dev/null || ! command -v jq &>/dev/null; then
-    echo "WARNING: curl or jq not found — skipping validation" >&2
+  if ! command -v curl &>/dev/null; then
+    echo "WARNING: curl not found — skipping validation" >&2
     exit 0
   fi
-  ok=$(curl -s "https://slack.com/api/auth.test" \
-    -H "Authorization: Bearer $xoxc" \
-    -b "d=$xoxd" | jq -r '.ok // false')
-  if [[ "$ok" == "true" ]]; then
-    echo "Validated: tokens are working."
-  else
-    echo "WARNING: auth.test failed — tokens may be invalid or expired." >&2
+  failures=0
+  while IFS=$'\t' read -r alias xoxc; do
+    [[ -z "$alias" ]] && continue
+    team=$(curl -s "https://slack.com/api/auth.test" \
+      -H "Authorization: Bearer $xoxc" \
+      -b "d=$(python3 -c 'import json,os;print(json.loads(os.environ["PAYLOAD"])["xoxd"])')" \
+      | python3 -c 'import json,sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    d = {}
+print(d.get("team", "") if d.get("ok") else "FAILED: " + d.get("error", "unknown"))')
+    if [[ "$team" == FAILED:* ]]; then
+      echo "  $alias: ${team}" >&2
+      failures=$((failures + 1))
+    else
+      echo "  $alias: ok ($team)"
+    fi
+  done < <(python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["PAYLOAD"])
+for account in payload["accounts"]:
+    print(f"{account['domain'] or account['team_id']}\t{account['xoxc']}")
+PY
+)
+  if (( failures > 0 )); then
+    echo "WARNING: $failures workspace(s) failed auth.test — those tokens may be expired." >&2
     exit 1
   fi
+  echo "Validated: all workspaces are working."
 fi

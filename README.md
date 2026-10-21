@@ -59,6 +59,8 @@ This repo ships as a Claude Code plugin with a guided setup skill. Claude will w
 
 Run the setup script. It handles everything — venv, Playwright, token extraction, wrapper script, and Claude Code registration. The only interaction required is logging in to Slack when the browser opens, and entering an optional channel ID for server logs, if desired.
 
+It extracts **every workspace that login is signed in to**, not just one, and writes them to `workspaces.json`. Sign in to all the workspaces you want Claude to reach before returning to the terminal.
+
 ```bash
 python3 <(curl -fsSL https://raw.githubusercontent.com/redhat-community-ai-tools/slack-mcp/main/scripts/setup-slack-mcp.py)
 ```
@@ -80,6 +82,11 @@ python3 slack-mcp/scripts/setup-slack-mcp.py
 | `--refresh-tokens`                   | Re-extract tokens when they expire (skips all other steps)                |
 | `--skip-verify`                      | Skip the post-setup smoke test                                            |
 
+> **Note:** the wrapper this writes runs the published container image, which
+> only gains multi-workspace support once it is rebuilt from a tree that has it.
+> Point it at a local build with `SLACK_MCP_IMAGE=...`, or install the server
+> directly with [uv](#running-as-a-uv-tool-local-no-container).
+
 
 When tokens expire, just run:
 
@@ -97,15 +104,23 @@ slack-mcp/scripts/slack-refresh-tokens --validate
 
 This reads tokens directly from the desktop app's local storage on disk — no DevTools, no Playwright, no manual steps. Requires the Slack app to be signed in.
 
-
-| Flag            | Description                                                                    |
-| --------------- | ------------------------------------------------------------------------------ |
-| `--validate`    | Verify tokens against Slack's API after extraction                             |
-| `--env`         | Print tokens as env vars to stdout (for piping into other tools)               |
-| `--output FILE` | Write tokens to a custom path (default: `~/.local/share/slack-mcp/tokens.env`) |
+Every signed-in workspace is extracted: Slack keeps one `xoxc` token per workspace in `localConfig_v2.teams`, alongside the single `d` cookie they all share.
 
 
-**Requirements:** `python3`, `python3-cryptography`, `secret-tool` (libsecret/gnome-keyring), `curl`, `jq`
+| Flag                | Description                                                                              |
+| ------------------- | ---------------------------------------------------------------------------------------- |
+| `--validate`        | Verify every workspace's token against Slack's API after extraction                      |
+| `--env`             | Print the default workspace's tokens as env vars to stdout (for piping into other tools) |
+| `--output FILE`     | Write `tokens.env` to a custom path (default: `~/.local/share/slack-mcp/tokens.env`)     |
+| `--workspaces FILE` | Write `workspaces.json` to a custom path (default: `<data>/workspaces.json`)             |
+| `--default ALIAS`   | Make `ALIAS` the default workspace                                                       |
+| `--slack-dir DIR`   | Override the auto-detected Slack data directory                                          |
+
+
+Both files are written with `0600` permissions. `tokens.env` keeps carrying the
+default workspace alone, so older setups and container images keep working.
+
+**Requirements:** `python3`, `python3-cryptography`, `secret-tool` (libsecret/gnome-keyring), `curl`
 
 This is useful for CI hooks or session startup scripts that need to silently refresh tokens before launching the MCP server.
 
@@ -158,8 +173,11 @@ If both `SLACK_BOT_TOKEN` and `SLACK_XOXC_TOKEN`/`SLACK_XOXD_TOKEN` are set, the
 ## Multiple workspaces
 
 The server can hold several Slack workspaces at once and act in any of them.
-Point `workspaces.json` at `~/.local/share/slack-mcp/` (override with
-`SLACK_MCP_WORKSPACES_FILE`):
+Both token extraction tools write this file for you — see
+[Setting Up with Claude Code](#setting-up-with-claude-code) and
+[Desktop App Token Refresh](#desktop-app-token-refresh-linux). It lives at
+`~/.local/share/slack-mcp/workspaces.json` (override with
+`SLACK_MCP_WORKSPACES_FILE`) and looks like this:
 
 ```json
 {
@@ -188,8 +206,14 @@ into, so `xoxd` is declared once at the top level; a per-account `xoxd` (or
   are ignored, and the server logs a line saying so. Without the file, those
   variables define a single account called `default`, exactly as before.
 
-Run `list_workspaces` to see the configured aliases, or
-`list_workspaces(verify=true)` to also check each token against `auth.test`.
+Aliases come from each workspace's Slack domain, so `acme.slack.com` becomes
+`acme`. Run `list_workspaces` to see them, or `list_workspaces(verify=true)` to
+also check each token against `auth.test`.
+
+Re-running either extractor matches accounts on team ID, so it refreshes tokens
+in place: it never renames a workspace, and it keeps settings you added by hand
+(`logs_channel`, a `bot_token`). Workspaces it does not find — a bot-token-only
+account has no `xoxc` in local storage — are left untouched.
 
 ### Selecting workspaces
 
@@ -292,6 +316,8 @@ Then the MCP client config needs **no `env` block** — just the command:
 ```
 
 The file uses `SLACK_MCP_XOXC_TOKEN` / `SLACK_MCP_XOXD_TOKEN`; the server maps those onto the `SLACK_XOXC_TOKEN` / `SLACK_XOXD_TOKEN` it uses. Override the path with `SLACK_MCP_TOKENS_FILE`. **Real environment variables always take precedence over the file**, so you can still override per-client.
+
+This path configures a single workspace. When `workspaces.json` is present it wins, and both `tokens.env` and the environment are ignored for account configuration — see [Multiple workspaces](#multiple-workspaces).
 
 ### Tokens from the client config (alternative)
 

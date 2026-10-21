@@ -10,6 +10,8 @@ Guide the user step-by-step through setting up the [redhat-community-ai-tools/sl
 
 The server uses browser session tokens (`xoxc`/`xoxd`) extracted from a logged-in Slack session — no Slack admin approval or OAuth app required.
 
+It supports **multiple workspaces at once**. The setup script picks up every workspace the Slack login is signed in to and writes them all to `workspaces.json`, so ask the user up front whether they use more than one — they should sign in to all of them while the browser is open.
+
 ## Step 0: Ensure This Plugin Is Installed
 
 Check if the plugin is already installed:
@@ -82,7 +84,7 @@ Tell the user:
 >
 > 1. Install Playwright and Chromium (one-time, ~2 min)
 > 2. Pull the `quay.io/redhat-ai-tools/slack-mcp` container image
-> 3. Open a Chromium browser — **log in to Slack**, then press Enter in the terminal
+> 3. Open a Chromium browser — **log in to Slack**. If you use more than one workspace, sign in to all of them now; each one found is added to `workspaces.json`. Then press Enter in the terminal
 > 4. Prompt you for a Slack channel ID to receive server logs (a self-DM or DM with Slackbot works well — navigate there in https://app.slack.com and copy the last segment of the URL)
 > 5. Write the wrapper script and update `~/.claude/settings.json` automatically
 >
@@ -98,7 +100,11 @@ Tell the user:
 
 **Wait for the user to confirm they have restarted.**
 
-The `slack` MCP server should now appear in the available tools. Suggest they test it by asking: *"What channels do I have access to in Slack?"*
+The `slack` MCP server should now appear in the available tools. Suggest they test it by asking: *"What are my Slack workspaces?"* — which calls `list_workspaces` and shows every account that was configured.
+
+If more than one workspace was set up, mention that status changes fan out across all of them by default: *"Set my Slack status to :calendar: In a meeting for 1 hour"*.
+
+Status changes need user (`xoxc`) tokens. `list_workspaces` reports `can_set_status: false` for any workspace configured with a bot token, since a bot token only changes the bot's own profile.
 
 ## Token Refresh
 
@@ -108,4 +114,12 @@ Tokens expire when the Slack browser session ends (typically weeks to months). W
 python3 /path/to/slack-mcp/scripts/setup-slack-mcp.py --refresh-tokens
 ```
 
-No other changes needed — the wrapper script picks up the new tokens automatically.
+No other changes needed — the wrapper script picks up the new tokens automatically. Re-running matches workspaces on team ID, so it refreshes tokens in place without renaming anything or losing hand-added settings.
+
+On Linux with the Slack desktop app installed, tokens can be refreshed without a browser at all:
+
+```bash
+/path/to/slack-mcp/scripts/slack-refresh-tokens --validate
+```
+
+That reads every signed-in workspace straight from the app's local storage and validates each token against `auth.test`.
