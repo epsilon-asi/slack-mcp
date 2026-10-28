@@ -200,7 +200,8 @@ into, so `xoxd` is declared once at the top level; a per-account `xoxd` (or
 - Each account caches channels and users separately, under
   `~/.local/share/slack-mcp/accounts/<team_id>/`. Channel names and user IDs are
   workspace-scoped, so a shared cache would resolve `#general` to whichever
-  workspace was cached first.
+  workspace was cached first — and `create_channel` sends each workspace's own
+  `team_id`, which Enterprise Grid requires.
 - **When `workspaces.json` exists, it is the only source of accounts** —
   `SLACK_BOT_TOKEN` and `SLACK_XOXC_TOKEN`/`SLACK_XOXD_TOKEN` in the environment
   are ignored, and the server logs a line saying so. Without the file, those
@@ -217,18 +218,28 @@ account has no `xoxc` in local storage — are left untouched.
 
 ### Selecting workspaces
 
-Tools that understand workspaces take a `workspace` argument:
+Every tool takes a `workspace` argument (the one exception is
+`list_workspaces`, which always reports them all):
 
 | Value | Meaning |
 | --- | --- |
 | omitted / `""` | the `default` account |
-| `"all"` or `"*"` | every configured account |
 | `"work"` | one account, by alias, team ID, or team name (case-insensitive) |
+| `"all"` or `"*"` | every configured account |
 | `"work,community"` | several, in the order given |
 
 An unknown name is rejected before any API call rather than silently skipped.
-Fan-out runs the workspaces concurrently and returns a per-workspace map, so one
-expired token does not stop the rest:
+
+**Most tools act in one workspace.** Posting a message, joining a channel or
+renaming one happens somewhere specific, so those tools reject `"all"` with an
+error naming the workspaces it matched rather than guessing. Reading is the same:
+channel IDs and user IDs only mean anything inside their own workspace.
+
+**Fan-out is opt-in per tool**, and limited to operations where "everywhere" is
+the obvious intent: the status and presence tools (which default to `"all"`), and
+`refresh_channel_cache` / `refresh_user_cache`. Those run the workspaces
+concurrently and return a per-workspace map, so one expired token does not stop
+the rest:
 
 ```json
 {
@@ -236,6 +247,9 @@ expired token does not stop the rest:
   "community": { "ok": false, "error": "token_expired" }
 }
 ```
+
+Nested calls stay put: when the activity log posts to a workspace's
+`logs_channel` during a fan-out, it posts to *that* workspace, not the default.
 
 ## Status across every workspace
 

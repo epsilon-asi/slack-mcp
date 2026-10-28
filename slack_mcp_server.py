@@ -1,5 +1,6 @@
 import argparse
 import contextvars
+import functools
 import os
 import sys
 from contextlib import contextmanager
@@ -371,6 +372,40 @@ def resolve_accounts(workspace: str = "") -> list[SlackAccount]:
             f"Unknown workspace(s): {', '.join(unknown)}. Configured: {known}"
         )
     return chosen
+
+
+def resolve_one(workspace: str = "") -> SlackAccount:
+    """Resolve a selector that must name exactly one workspace.
+
+    An empty selector means "whichever account is already active", not "the
+    default": a tool called from inside a fan-out (post_message via
+    log_to_slack, say) must stay in the workspace being fanned out to.
+    """
+    if not (workspace or "").strip():
+        return _current_account()
+    accounts = resolve_accounts(workspace)
+    if len(accounts) > 1:
+        raise ValueError(
+            f"This tool acts in one workspace at a time, but '{workspace}' selects "
+            f"{len(accounts)}: {', '.join(a.alias for a in accounts)}. Name just one."
+        )
+    return accounts[0]
+
+
+def _workspace_aware(fn):
+    """Run a tool in the workspace its `workspace` argument names.
+
+    The wrapped function keeps its own signature (functools.wraps sets
+    __wrapped__, which inspect.signature follows), so FastMCP still sees the
+    `workspace` parameter and advertises it.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        with _using_account(resolve_one(kwargs.get("workspace", ""))):
+            return await fn(*args, **kwargs)
+
+    return wrapper
 
 
 async def _fan_out(
@@ -777,15 +812,20 @@ async def get_thread_replies(channel_id: str, thread_ts: str) -> list[dict[str, 
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@_workspace_aware
 async def get_thread(
     channel_id: str,
     thread_ts: str,
-    limit: int = 100
+    limit: int = 100,
+    workspace: str = "",
 ) -> list[dict[str, Any] | str]:
     """Get all messages in a thread given a channel ID and the parent message timestamp.
 
     Use this to read a full conversation thread before replying to it.
     The thread_ts is the timestamp of the parent message that started the thread.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
     """
     await log_to_slack(f"Getting thread {thread_ts} in channel <#{channel_id}> (limit: {limit})")
     url = f"{SLACK_API_BASE}/conversations.replies"
@@ -819,12 +859,14 @@ async def get_thread(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@_workspace_aware
 async def get_channel_history(
     channel_id: str,
     limit: int = 1000,
     oldest: str = "",
     latest: str = "",
-    include_threads: bool = False
+    include_threads: bool = False,
+    workspace: str = "",
 ) -> list[dict[str, Any] | str]:
     """Get the history of a channel with pagination support. Limit parameter controls max messages to fetch (default 1000).
 
@@ -834,6 +876,9 @@ async def get_channel_history(
     - include_threads: If True, also fetch all replies in threads (default False)
 
     Note: For date-only formats, 'oldest' defaults to start of day (00:00:00) and 'latest' to end of day (23:59:59).
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
     """
     await log_to_slack(f"Getting history of channel <#{channel_id}> (limit: {limit}, include_threads: {include_threads})")
     url = f"{SLACK_API_BASE}/conversations.history"
@@ -945,8 +990,13 @@ async def _load_channels_to_cache(account: SlackAccount | None = None) -> bool:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
-async def get_channel_id_by_name(channel_name: str) -> str:
-    """Get the channel ID by channel name. The channel name can be with or without the # prefix."""
+@_workspace_aware
+async def get_channel_id_by_name(channel_name: str, workspace: str = "") -> str:
+    """Get the channel ID by channel name. The channel name can be with or without the # prefix.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
+    """
     # Remove # prefix if present
     clean_name = channel_name.lstrip("#")
     await log_to_slack(f"Looking up channel ID for channel name: {clean_name}")
@@ -1016,13 +1066,17 @@ async def refresh_user_cache(workspace: str = "") -> int:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=True))
-async def resolve_user_id(query: str) -> list[dict[str, str]]:
+@_workspace_aware
+async def resolve_user_id(query: str, workspace: str = "") -> list[dict[str, str]]:
     """Resolve a Slack user ID from a name, @handle, or email address.
 
     Searches the full workspace member list (cached for 24h).
     Returns up to 5 matches sorted by relevance: exact handle > exact email >
     case-insensitive name > partial substring match.
     Each result contains id, handle, real_name, display_name, and email.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
     """
     await log_to_slack(f"Resolving user ID for: {query}")
     users = await _fetch_all_users(_current_account())
@@ -1058,6 +1112,7 @@ async def resolve_user_id(query: str) -> list[dict[str, str]]:
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
+@_workspace_aware
 async def post_message(
     channel_id: str,
     message: str,
@@ -1066,10 +1121,14 @@ async def post_message(
     unfurl_links: bool = True,
     unfurl_media: bool = True,
     blocks: str = "",
+    workspace: str = "",
 ) -> dict:
     """Post a message to a channel. Optionally pass Block Kit blocks as a JSON string for rich formatting (e.g. nested lists via rich_text blocks). When blocks is provided, message is used as the plaintext fallback.
 
     Returns a dict {"ok": bool, "ts": str}. On success, "ts" is the posted message's timestamp, which can be passed back as thread_ts to post threaded replies.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
     """
     _deny_if_read_only()
     if not skip_log:
@@ -1095,10 +1154,16 @@ async def post_message(
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
+@_workspace_aware
 async def post_command(
-    channel_id: str, command: str, text: str, skip_log: bool = False
+    channel_id: str, command: str, text: str, skip_log: bool = False,
+    workspace: str = "",
 ) -> bool:
-    """Post a command to a channel."""
+    """Post a command to a channel.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
+    """
     _deny_if_read_only()
     if not skip_log:
         await log_to_slack(
@@ -1112,8 +1177,13 @@ async def post_command(
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
-async def add_reaction(channel_id: str, message_ts: str, reaction: str) -> bool:
-    """Add a reaction to a message."""
+@_workspace_aware
+async def add_reaction(channel_id: str, message_ts: str, reaction: str, workspace: str = "") -> bool:
+    """Add a reaction to a message.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
+    """
     _deny_if_read_only()
     await log_to_slack(
         f"Adding reaction to message {message_ts} in channel <#{channel_id}>: :{reaction}:"
@@ -1128,10 +1198,16 @@ async def add_reaction(channel_id: str, message_ts: str, reaction: str) -> bool:
     return bool(data and data.get("ok"))
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@_workspace_aware
 async def get_reactions(
-    channel_id: str, message_ts: str, full: bool = True
+    channel_id: str, message_ts: str, full: bool = True,
+    workspace: str = "",
 ) -> list[dict] | None:
-    """Get reactions to a message."""
+    """Get reactions to a message.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
+    """
     await log_to_slack(
         f"Getting reaction to message {message_ts} in channel <#{channel_id}>"
     )
@@ -1149,8 +1225,13 @@ async def get_reactions(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
-async def whoami() -> str:
-    """Checks authentication & identity."""
+@_workspace_aware
+async def whoami(workspace: str = "") -> str:
+    """Checks authentication & identity.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
+    """
     await log_to_slack("Checking authentication & identity")
     url = f"{SLACK_API_BASE}/auth.test"
     data = await make_request(url)
@@ -1158,8 +1239,13 @@ async def whoami() -> str:
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
-async def join_channel(channel_id: str, skip_log: bool = False) -> bool:
-    """Join a channel."""
+@_workspace_aware
+async def join_channel(channel_id: str, skip_log: bool = False, workspace: str = "") -> bool:
+    """Join a channel.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
+    """
     _deny_if_read_only()
     if not skip_log:
         await log_to_slack(f"Joining channel <#{channel_id}>")
@@ -1170,12 +1256,15 @@ async def join_channel(channel_id: str, skip_log: bool = False) -> bool:
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
-async def create_channel(name: str, is_private: bool = False) -> str | None:
+@_workspace_aware
+async def create_channel(name: str, is_private: bool = False, workspace: str = "") -> str | None:
     """Create a new Slack channel.
 
     Args:
         name: Channel name (will be sanitized: lowercase, hyphens, no spaces)
         is_private: Create as private channel (default: False for public)
+        workspace: Act in this workspace, by alias or team ID; empty for the
+            default one. See list_workspaces.
 
     Returns:
         Channel ID on success, None on failure
@@ -1215,12 +1304,15 @@ async def create_channel(name: str, is_private: bool = False) -> str | None:
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
-async def invite_users_to_channel(channel_id: str, user_ids: list[str]) -> bool:
+@_workspace_aware
+async def invite_users_to_channel(channel_id: str, user_ids: list[str], workspace: str = "") -> bool:
     """Invite multiple users to a channel.
 
     Args:
         channel_id: Target channel ID (C...)
         user_ids: List of user IDs to invite (U...)
+        workspace: Act in this workspace, by alias or team ID; empty for the
+            default one. See list_workspaces.
 
     Returns:
         True if all invitations succeeded, False otherwise
@@ -1253,12 +1345,15 @@ async def invite_users_to_channel(channel_id: str, user_ids: list[str]) -> bool:
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
-async def rename_channel(channel_id: str, new_name: str) -> bool:
+@_workspace_aware
+async def rename_channel(channel_id: str, new_name: str, workspace: str = "") -> bool:
     """Rename a Slack channel.
 
     Args:
         channel_id: Target channel ID (C...)
         new_name: New channel name (will be sanitized: lowercase, hyphens, no spaces)
+        workspace: Act in this workspace, by alias or team ID; empty for the
+            default one. See list_workspaces.
 
     Returns:
         True if rename succeeded, False otherwise
@@ -1300,16 +1395,21 @@ async def rename_channel(channel_id: str, new_name: str) -> bool:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@_workspace_aware
 async def list_joined_channels(
     exclude_archived: bool = True,
     limit: int = 1000,
     types: str = "public_channel,private_channel",
+    workspace: str = "",
 ) -> list[dict[str, Any]]:
     """List channels the authenticated user is a member of.
 
     Uses Slack's users.conversations API. By default returns public and private
     channels only. To include DMs and group DMs, set types to e.g.
-    \"public_channel,private_channel,im,mpim\".
+    "public_channel,private_channel,im,mpim".
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
     """
     await log_to_slack(
         f"Listing joined channels (limit: {limit}, types: {types}, exclude_archived: {exclude_archived})"
@@ -1393,7 +1493,8 @@ async def get_random_deleted_user() -> str | None:
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
-async def clear_usergroup(usergroup_id: str) -> bool:
+@_workspace_aware
+async def clear_usergroup(usergroup_id: str, workspace: str = "") -> bool:
     """Clear all users from a Slack usergroup.
 
     Since Slack API doesn't support empty usergroups, this uses a workaround
@@ -1402,6 +1503,8 @@ async def clear_usergroup(usergroup_id: str) -> bool:
 
     Args:
         usergroup_id: The usergroup ID (S...) to clear
+        workspace: Act in this workspace, by alias or team ID; empty for the
+            default one. See list_workspaces.
 
     Returns:
         True if usergroup was cleared successfully, False otherwise
@@ -1439,13 +1542,16 @@ async def clear_usergroup(usergroup_id: str) -> bool:
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
-async def update_usergroup_members(usergroup_id: str, user_ids: list[str]) -> bool:
+@_workspace_aware
+async def update_usergroup_members(usergroup_id: str, user_ids: list[str], workspace: str = "") -> bool:
     """Set the members of a Slack usergroup, replacing the current membership entirely.
 
     Args:
         usergroup_id: The usergroup ID (S...) to update
         user_ids: List of user IDs (U...) that should be the members. Must contain
                   at least one user — use clear_usergroup to remove all members.
+        workspace: Act in this workspace, by alias or team ID; empty for the
+            default one. See list_workspaces.
 
     Returns:
         True if the membership was updated successfully, False otherwise
@@ -1478,14 +1584,20 @@ async def update_usergroup_members(usergroup_id: str, user_ids: list[str]) -> bo
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
+@_workspace_aware
 async def send_dm(
     user_id: str,
     message: str,
     unfurl_links: bool = True,
     unfurl_media: bool = True,
     blocks: str = "",
+    workspace: str = "",
 ) -> bool:
-    """Send a direct message to a user. Optionally pass Block Kit blocks as a JSON string for rich formatting (e.g. nested lists via rich_text blocks). When blocks is provided, message is used as the plaintext fallback."""
+    """Send a direct message to a user. Optionally pass Block Kit blocks as a JSON string for rich formatting (e.g. nested lists via rich_text blocks). When blocks is provided, message is used as the plaintext fallback.
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
+    """
     _deny_if_read_only()
     await log_to_slack(f"Sending direct message to user <@{user_id}>: {message}")
     url = f"{SLACK_API_BASE}/conversations.open"
@@ -1505,18 +1617,22 @@ async def send_dm(
 
 
 @_register_tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True))
+@_workspace_aware
 async def send_group_dm(
     user_ids: list[str],
     message: str,
     unfurl_links: bool = True,
     unfurl_media: bool = True,
     blocks: str = "",
+    workspace: str = "",
 ) -> bool:
     """Send a message to a group DM (multi-party direct message).
 
     Args:
         user_ids: List of 2+ user IDs to include in group DM
         message: Message text to send
+        workspace: Act in this workspace, by alias or team ID; empty for the
+            default one. See list_workspaces.
 
     Returns:
         True if message sent successfully, False otherwise
@@ -1559,10 +1675,16 @@ async def send_group_dm(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@_workspace_aware
 async def search_messages(
-    query: str, sort: Literal["timestamp", "score"] = "timestamp", limit: int = 1000
+    query: str, sort: Literal["timestamp", "score"] = "timestamp", limit: int = 1000,
+    workspace: str = "",
 ) -> list[dict[str, Any] | str]:
-    """Search for messages in the workspace with pagination support. Limit parameter controls max results to fetch (default 1000)."""
+    """Search for messages in the workspace with pagination support. Limit parameter controls max results to fetch (default 1000).
+
+    Set `workspace` to act in one specific workspace, by alias or team ID;
+    leave it empty for the default one. See list_workspaces.
+    """
     await log_to_slack(f"Searching for messages: {query} (limit: {limit})")
     url = f"{SLACK_API_BASE}/search.messages"
 
@@ -1618,11 +1740,13 @@ async def search_messages(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=True))
+@_workspace_aware
 async def search_channel_messages(
     channel_id: str,
     query: str,
     sort: Literal["timestamp", "score"] = "timestamp",
     limit: int = 100,
+    workspace: str = "",
 ) -> list[dict[str, Any] | str]:
     """Search for messages within a specific channel.
 
@@ -1633,6 +1757,8 @@ async def search_channel_messages(
         query: The search query text.
         sort: Sort results by "timestamp" (newest first) or "score" (relevance).
         limit: Max number of results to return (default 100).
+        workspace: Act in this workspace, by alias or team ID; empty for the
+            default one. See list_workspaces.
     """
     await log_to_slack(f"Searching in channel <#{channel_id}> for: {query} (limit: {limit})")
     url = f"{SLACK_API_BASE}/search.messages"
