@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# The suite only reads the checkout; nothing needs write access.
+permissions:
+  contents: read
+
+# A force-push supersedes the run it interrupts.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      # One version failing is a result worth having, not a reason to stop
+      # the others.
+      fail-fast: false
+      matrix:
+        # pyproject declares requires-python = ">=3.10", and the Containerfile
+        # ships 3.11, so the floor and the shipped version are both covered.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Run tests
+        # There is no lockfile, so uv resolves the dev group on the fly.
+        run: uv run --python ${{ matrix.python-version }} --group dev pytest -q
