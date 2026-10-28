@@ -6,8 +6,8 @@ What this script does (automatically):
   1. Checks prerequisites (python3, podman)
   2. Creates a virtual environment and installs Playwright + Chromium
   3. Pulls the Slack MCP container image
-  4. Opens a browser to extract your Slack session tokens
-     (only manual step: log in to Slack when the browser opens)
+  4. Opens a browser to extract session tokens for every Slack workspace
+     you are signed in to (only manual step: log in when the browser opens)
   5. Prompts for a Slack channel ID to use for MCP server logs
   6. Writes a wrapper script that launches the MCP server
   7. Registers the MCP server in ~/.claude.json
@@ -16,11 +16,13 @@ Usage:
   python3 setup-slack-mcp.py
   python3 setup-slack-mcp.py --refresh-tokens                    # re-extract tokens
   python3 setup-slack-mcp.py --set-logs-channel DXXXXXXXXX       # skip the prompt
+  python3 setup-slack-mcp.py --workspace https://myco.slack.com  # open a specific workspace
 """
 
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -29,13 +31,16 @@ from pathlib import Path
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
-INSTALL_DIR    = Path.home() / ".local" / "share" / "slack-mcp"
-VENV_DIR       = INSTALL_DIR / ".venv"
-TOKENS_FILE    = INSTALL_DIR / "tokens.env"
-WRAPPER_SCRIPT = INSTALL_DIR / "run-slack-mcp.sh"
+INSTALL_DIR     = Path(os.environ.get("SLACK_MCP_DATA") or Path.home() / ".local" / "share" / "slack-mcp")
+VENV_DIR        = INSTALL_DIR / ".venv"
+TOKENS_FILE     = INSTALL_DIR / "tokens.env"
+WORKSPACES_FILE = INSTALL_DIR / "workspaces.json"
+WRAPPER_SCRIPT  = INSTALL_DIR / "run-slack-mcp.sh"
 CLAUDE_SETTINGS = Path.home() / ".claude.json"
 
-MCP_IMAGE       = "quay.io/redhat-ai-tools/slack-mcp"
+# Override when running a locally built image — the published one only gains
+# multi-workspace support once it is rebuilt from a tree that has it.
+MCP_IMAGE       = os.environ.get("SLACK_MCP_IMAGE", "quay.io/redhat-ai-tools/slack-mcp")
 MCP_SERVER_NAME = "slack"
 PROFILE_DIR     = Path.home() / ".slack-token-extractor" / "browser-profile"
 
@@ -153,10 +158,111 @@ def pull_image() -> None:
 
 
 def tokens_exist() -> bool:
+    if WORKSPACES_FILE.exists():
+        config = read_workspaces(WORKSPACES_FILE)
+        if any(
+            isinstance(e, dict) and (e.get("xoxc") or e.get("bot_token"))
+            for e in (config.get("accounts") or {}).values()
+        ):
+            return True
     if not TOKENS_FILE.exists():
         return False
     text = TOKENS_FILE.read_text()
     return "SLACK_MCP_XOXC_TOKEN=xoxc-" in text and "SLACK_MCP_XOXD_TOKEN=" in text
+
+
+# ── workspaces.json ──────────────────────────────────────────────────────────
+#
+# This script is published for `python3 <(curl ...)`, so it stays standalone
+# rather than importing scripts/slack_workspaces.py. Both writers are covered by
+# tests/test_workspaces_config.py, which asserts they agree on the schema.
+
+def read_workspaces(path: Path) -> dict:
+    """Load an existing config, or an empty one when absent or unreadable."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def alias_for(account: dict, taken: set) -> str:
+    """A short, stable alias for a workspace, unique within `taken`."""
+    raw = str(account.get("domain") or account.get("team_name") or account.get("team_id") or "workspace")
+    alias = re.sub(r"[^a-z0-9_-]", "-", raw.lower()).strip("-") or "workspace"
+    if alias not in taken:
+        return alias
+    for suffix in range(2, 100):
+        if (candidate := f"{alias}-{suffix}") not in taken:
+            return candidate
+    return f"{alias}-{account.get('team_id', 'x')}".lower()
+
+
+def merge_workspaces_config(
+    existing: dict, accounts: list, xoxd: str, default: str = "", logs_channel: str = ""
+) -> dict:
+    """Fold freshly extracted accounts into an existing config.
+
+    Accounts are matched on team ID, so re-running never renames a workspace or
+    drops hand-added settings. Workspaces the browser did not see are preserved:
+    a bot-token-only account has no xoxc to find.
+    """
+    merged = dict(existing)
+    current = dict(merged.get("accounts") or {})
+
+    by_team = {
+        str(entry["team_id"]): alias
+        for alias, entry in current.items()
+        if isinstance(entry, dict) and entry.get("team_id")
+    }
+
+    for account in accounts:
+        alias = by_team.get(account["team_id"]) or alias_for(account, set(current))
+        entry = dict(current.get(alias) or {})
+        entry["team_id"] = account["team_id"]
+        if account.get("team_name"):
+            entry["team_name"] = account["team_name"]
+        entry["xoxc"] = account["xoxc"]
+        # A per-account xoxd would shadow the shared one written below.
+        entry.pop("xoxd", None)
+        entry.pop("xoxd_token", None)
+        current[alias] = entry
+        by_team[account["team_id"]] = alias
+
+    merged["accounts"] = current
+    if xoxd:
+        merged["xoxd"] = xoxd
+
+    chosen = default or merged.get("default")
+    if chosen not in current:
+        chosen = next(iter(current), None)
+    if chosen:
+        merged["default"] = chosen
+        # The logs channel is an ID in one workspace, so it belongs to one account.
+        if logs_channel:
+            current[chosen]["logs_channel"] = logs_channel
+
+    return {
+        key: merged[key]
+        for key in ("default", "xoxd", "accounts", *sorted(set(merged) - {"default", "xoxd", "accounts"}))
+        if key in merged
+    }
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a 0600 file, created with those permissions from the start."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
 
 
 # Inline extraction script — run inside the venv so Playwright is available.
@@ -166,7 +272,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 workspace_url    = sys.argv[1]
-output_file      = sys.argv[2]
+payload_file     = sys.argv[2]
 profile_dir      = Path(sys.argv[3])
 channel_id_file  = sys.argv[4]
 
@@ -304,30 +410,40 @@ with sync_playwright() as p:
 
     print(f"  Found team ID: {team_id}")
 
-    # XOXC token
-    xoxc = page.evaluate("""(tid) => {
+    # Every workspace this login is signed in to. Slack keeps one xoxc token
+    # per workspace in localConfig_v2.teams; teams with no token are signed out.
+    accounts = page.evaluate("""() => {
         try {
             const c = JSON.parse(localStorage.localConfig_v2 || '{}');
-            if (c.teams?.[tid]?.token) return c.teams[tid].token;
-            for (const d of Object.values(c.teams || {}))
-                if (d.token?.startsWith('xoxc-')) return d.token;
-        } catch {}
-        return null;
-    }""", team_id)
+            return Object.entries(c.teams || {}).map(([key, t]) => ({
+                team_id: (t && t.id) || key || '',
+                team_name: (t && t.name) || '',
+                domain: (t && t.domain) || '',
+                xoxc: (t && t.token) || '',
+            })).filter(t => t.xoxc.startsWith('xoxc-') && t.team_id);
+        } catch { return []; }
+    }""") or []
 
-    if not xoxc:
-        # Last-resort: scan page HTML
+    if not accounts:
+        # Last-resort: a single token scraped from the page HTML.
         xoxc = page.evaluate("""() => {
             const m = document.body.innerHTML.match(/"token":"(xoxc-[^"]+)"/);
             return m ? m[1] : null;
         }""")
+        if xoxc:
+            accounts = [{"team_id": team_id, "team_name": "", "domain": "", "xoxc": xoxc}]
 
-    if not xoxc:
-        print("  ERROR: Could not extract XOXC token.")
+    if not accounts:
+        print("  ERROR: Could not extract any XOXC token.")
         browser.close()
         sys.exit(1)
 
-    print("  ✓ Found XOXC token")
+    # Put the workspace the browser is currently on first; it becomes the default.
+    accounts.sort(key=lambda a: a["team_id"] != team_id)
+
+    print(f"  ✓ Found {len(accounts)} workspace(s):")
+    for a in accounts:
+        print(f"      {a['domain'] or a['team_id']:<24} {a['team_name']}")
 
     # XOXD cookie
     xoxd = next(
@@ -341,34 +457,32 @@ with sync_playwright() as p:
         browser.close()
         sys.exit(1)
 
-    print("  ✓ Found XOXD token")
+    print("  ✓ Found XOXD token (shared by every workspace)")
     browser.close()
 
-with open(output_file, "w") as f:
-    f.write(f"# Slack session tokens (auto-generated by setup-slack-mcp.py)\n")
-    f.write(f"# Team ID: {team_id}\n\n")
-    f.write(f"SLACK_MCP_XOXC_TOKEN={xoxc}\n")
-    f.write(f"SLACK_MCP_XOXD_TOKEN={xoxd}\n")
-
-os.chmod(output_file, 0o600)
-print(f"  Tokens saved to: {output_file}")
+# Hand the raw findings back to the parent, which owns the on-disk format.
+Path(payload_file).write_text(json.dumps({"xoxd": xoxd, "accounts": accounts}))
+os.chmod(payload_file, 0o600)
 
 if channel_id:
     Path(channel_id_file).write_text(channel_id)
 '''
 
 
-def extract_tokens(python: Path, workspace_url: str, refresh: bool) -> str:
+def extract_tokens(python: Path, workspace_url: str, refresh: bool) -> tuple:
+    """Returns (logs_channel_id_from_browser, payload_or_None)."""
     banner("Extracting Slack session tokens")
 
     if tokens_exist() and not refresh:
-        print(f"  ✓ Tokens already exist at {TOKENS_FILE}")
+        print(f"  ✓ Tokens already exist at {WORKSPACES_FILE}")
         print("    Run with --refresh-tokens to re-extract.")
-        return ""
+        return "", None
 
     print("  A browser window is about to open. Before it does, read the directions below:")
     print()
-    print("    1. Log in to your Slack workspace when the browser opens")
+    print("    1. Log in to Slack when the browser opens. Every workspace this")
+    print("       login is signed in to will be picked up, so sign in to all of")
+    print("       them if you want Claude to reach them all.")
     print("    2. The MCP server logs its activity to a Slack channel so you can")
     print("       monitor what it's doing. Navigate to the channel or DM you want")
     print("       to use (a self-DM or Slackbot DM works great) and note the")
@@ -390,28 +504,76 @@ def extract_tokens(python: Path, workspace_url: str, refresh: bool) -> str:
 
     channel_id_file = INSTALL_DIR / "channel_id.tmp"
     channel_id_file.unlink(missing_ok=True)
+    payload_file = INSTALL_DIR / "workspaces.payload.json"
+    payload_file.unlink(missing_ok=True)
 
     try:
         run([
             str(python),
             str(extract_file),
             workspace_url,
-            str(TOKENS_FILE),
+            str(payload_file),
             str(PROFILE_DIR),
             str(channel_id_file),
         ])
     except subprocess.CalledProcessError:
         print("\n  Token extraction failed. See output above.")
-        extract_file.unlink(missing_ok=True)
         sys.exit(1)
     finally:
         extract_file.unlink(missing_ok=True)
 
+    payload = None
+    if payload_file.exists():
+        try:
+            payload = json.loads(payload_file.read_text())
+        except ValueError:
+            print("  Warning: could not read the extracted token payload.")
+        finally:
+            payload_file.unlink(missing_ok=True)
+
+    channel_id = ""
     if channel_id_file.exists():
         channel_id = channel_id_file.read_text().strip()
         channel_id_file.unlink()
-        return channel_id
-    return ""
+    return channel_id, payload
+
+
+def save_workspaces(payload: dict, logs_channel: str) -> dict:
+    """Merge the extracted workspaces into workspaces.json and tokens.env."""
+    banner("Writing workspace configuration")
+
+    config = merge_workspaces_config(
+        read_workspaces(WORKSPACES_FILE),
+        (payload or {}).get("accounts") or [],
+        (payload or {}).get("xoxd") or "",
+        logs_channel=logs_channel,
+    )
+    accounts = config.get("accounts") or {}
+    if not accounts:
+        print("  No workspaces configured yet — nothing to write.")
+        return config
+
+    write_private(WORKSPACES_FILE, json.dumps(config, indent=2) + "\n")
+    default_alias = config.get("default", "")
+    print(f"  ✓ Written: {WORKSPACES_FILE}")
+    for alias, entry in accounts.items():
+        marker = "  [default]" if alias == default_alias else ""
+        print(f"      {alias:<24} {entry.get('team_id', ''):<14}{marker}")
+
+    # tokens.env still carries the default workspace, for setups (and container
+    # images) that predate multi-workspace support.
+    entry = accounts.get(default_alias) or {}
+    if entry.get("xoxc") and config.get("xoxd"):
+        write_private(
+            TOKENS_FILE,
+            "# Slack session tokens (auto-generated by setup-slack-mcp.py)\n"
+            f"# Team ID: {entry.get('team_id', '')}\n\n"
+            f"SLACK_MCP_XOXC_TOKEN={entry['xoxc']}\n"
+            f"SLACK_MCP_XOXD_TOKEN={config['xoxd']}\n",
+        )
+        print(f"  ✓ Written: {TOKENS_FILE} (default workspace only)")
+
+    return config
 
 
 def write_wrapper(logs_channel: str) -> None:
@@ -419,13 +581,20 @@ def write_wrapper(logs_channel: str) -> None:
 
     runtime = "podman" if shutil.which("podman") else "docker"
 
+    # Mount the data directory rather than passing tokens as env vars: the
+    # server reads workspaces.json and tokens.env from there itself, and writes
+    # its per-workspace caches back. :Z relabels for SELinux under podman.
+    mount = f"{INSTALL_DIR}:/data" + (":Z" if runtime == "podman" else "")
+
     # Build env args as a list so there are no stray line-continuation issues
     env_lines = [
-        '  -e SLACK_XOXC_TOKEN="${SLACK_MCP_XOXC_TOKEN}" \\',
-        '  -e SLACK_XOXD_TOKEN="${SLACK_MCP_XOXD_TOKEN}" \\',
+        f'  -v "{mount}" \\',
+        "  -e SLACK_MCP_DATA=/data \\",
         "  -e MCP_TRANSPORT=stdio \\",
     ]
     if logs_channel:
+        # Only used when no workspaces.json is present; otherwise each account
+        # carries its own logs_channel.
         env_lines.append(f'  -e LOGS_CHANNEL_ID="{logs_channel}" \\')
 
     env_block = "\n".join(env_lines)
@@ -436,16 +605,13 @@ def write_wrapper(logs_channel: str) -> None:
 # Re-run setup-slack-mcp.py to regenerate or update this file.
 set -euo pipefail
 
-TOKENS="{TOKENS_FILE}"
+DATA="{INSTALL_DIR}"
 
-if [[ ! -f "$TOKENS" ]]; then
-  echo "Error: $TOKENS not found." >&2
+if [[ ! -f "$DATA/workspaces.json" && ! -f "$DATA/tokens.env" ]]; then
+  echo "Error: no Slack tokens found in $DATA." >&2
   echo "Re-run: python3 setup-slack-mcp.py --refresh-tokens" >&2
   exit 1
 fi
-
-# shellcheck source=/dev/null
-source "$TOKENS"
 
 exec {runtime} run -i --rm \\
 {env_block}
@@ -539,6 +705,7 @@ Examples:
   python3 setup-slack-mcp.py
   python3 setup-slack-mcp.py --refresh-tokens
   python3 setup-slack-mcp.py --set-logs-channel C01234567
+  python3 setup-slack-mcp.py --workspace https://myco.slack.com
         """,
     )
     parser.add_argument(
@@ -551,6 +718,12 @@ Examples:
         default="",
         metavar="CHANNEL_ID",
         help="Slack channel ID for MCP server log output (optional; prompted interactively if not provided, press Enter to skip)",
+    )
+    parser.add_argument(
+        "--workspace",
+        default="",
+        metavar="URL",
+        help=f"Slack workspace URL to open in the browser (default: {DEFAULT_WORKSPACE})",
     )
     parser.add_argument(
         "--skip-verify",
@@ -570,8 +743,11 @@ Examples:
     check_prerequisites()
     python = setup_venv()
     pull_image()
-    channel_id_from_browser = extract_tokens(python, DEFAULT_WORKSPACE, refresh=args.refresh_tokens)
+    channel_id_from_browser, payload = extract_tokens(
+        python, args.workspace or DEFAULT_WORKSPACE, refresh=args.refresh_tokens
+    )
     logs_channel = args.set_logs_channel or channel_id_from_browser or prompt_logs_channel()
+    config = save_workspaces(payload, logs_channel)
     write_wrapper(logs_channel)
     register_mcp()
 
@@ -583,13 +759,18 @@ Examples:
     print("║  Setup complete!                                          ║")
     print("╚═══════════════════════════════════════════════════════════╝")
     print()
+    aliases = list((config.get("accounts") or {}).keys())
     print(f"  MCP server name : {MCP_SERVER_NAME}")
     print(f"  Wrapper script  : {WRAPPER_SCRIPT}")
-    print(f"  Tokens          : {TOKENS_FILE}")
+    print(f"  Workspaces      : {WORKSPACES_FILE}")
+    if aliases:
+        print(f"                    {', '.join(aliases)} (default: {config.get('default', '')})")
     print(f"  Claude settings : {CLAUDE_SETTINGS}")
     print()
     print("  Start a new Claude Code session to activate the plugin.")
-    print("  Test it by asking: 'What is my username in Slack?'")
+    print("  Test it by asking: 'What are my Slack workspaces?'")
+    if len(aliases) > 1:
+        print("  Then try: 'Set my Slack status to :calendar: In a meeting everywhere'")
     print()
     print("  To refresh tokens when they expire:")
     print("    python3 setup-slack-mcp.py --refresh-tokens")
